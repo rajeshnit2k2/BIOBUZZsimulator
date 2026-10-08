@@ -30,7 +30,8 @@ DRIVING (practice + match TELEOP)
   F fill the Flower in front of you (needs a Slide raised above 21.5in, or an Arm)
   G drop a piece (e.g. in your Garden)   Up/Down lift   N human player Nectar (practice)
   TAB OpMode (practice)   R reset field   C Wi-Fi   T touch sensor   H spin hub
-  1/2/3/4 camera: overview / follow / driver station / wiring bench   B build mode
+  1/2/3/4 camera: overview / follow / driver station / wiring bench   B build mode   M mute   K music on/off
+  (Put your own my_music.ogg / .wav next to this file to use it as the background music.)
 
 BUILD CONTROLS
   Left click place   R/T/F rotate   M mirror   X/Delete delete   G pick up
@@ -91,6 +92,297 @@ void main() {
 ''')
 
 SH = lit_with_shadows_shader if SHADOWS else soft_light_shader
+
+
+# ----------------------------------------------------------------------------
+# SOUND: every effect is synthesized in code (no downloads needed) and cached
+# as .wav files in a "sim_sounds" folder next to this script.  M = mute.
+# ----------------------------------------------------------------------------
+import wave
+import time as _pytime
+import struct
+from array import array
+
+SOUND_VERSION = 2
+SR = 22050
+
+
+def _env(n, attack=.01, release=.1):
+    a, r = max(1, int(attack * SR)), max(1, int(release * SR))
+    return [min(1.0, i / a, (n - i) / r) for i in range(n)]
+
+
+def _tone(freq, dur, wave_='sine', vol=.5, attack=.005, release=.08, sweep_to=None):
+    n = int(dur * SR)
+    env = _env(n, attack, release)
+    out, ph = [0.0] * n, 0.0
+    for i in range(n):
+        f = freq if sweep_to is None else freq + (sweep_to - freq) * i / n
+        ph += f / SR
+        x = ph % 1.0
+        if wave_ == 'sine':
+            v = math.sin(2 * math.pi * x)
+        elif wave_ == 'square':
+            v = 1.0 if x < .5 else -1.0
+        elif wave_ == 'saw':
+            v = 2 * x - 1
+        else:                                       # triangle
+            v = 4 * abs(x - .5) - 1
+        out[i] = v * env[i] * vol
+    return out
+
+
+def _noise(dur, vol=.4, smooth=.0, attack=.005, release=.1, smooth_to=None):
+    n = int(dur * SR)
+    env = _env(n, attack, release)
+    out, y = [0.0] * n, 0.0
+    for i in range(n):
+        k = smooth if smooth_to is None else smooth + (smooth_to - smooth) * i / n
+        y = y * k + random.uniform(-1, 1) * (1 - k)
+        out[i] = y * env[i] * vol * (1 + 2 * k)
+    return out
+
+
+def _mix(*parts):
+    """parts: (offset_seconds, samples)"""
+    n = max(int(o * SR) + len(p) for o, p in parts)
+    out = [0.0] * n
+    for o, p in parts:
+        s = int(o * SR)
+        for i, v in enumerate(p):
+            out[s + i] += v
+    return out
+
+
+def _bell(freq, dur, vol=.35):
+    return _mix((0, _tone(freq, dur, 'sine', vol, .002, dur * .9)),
+                (0, _tone(freq * 2.01, dur * .6, 'sine', vol * .4, .002, dur * .5)),
+                (0, _tone(freq * 3.03, dur * .3, 'sine', vol * .2, .002, dur * .25)))
+
+
+def _make_sounds():
+    S = {}
+    S['click'] = _tone(1500, .035, 'sine', .3, .001, .03)
+    S['place'] = _mix((0, _tone(180, .09, 'triangle', .5, .001, .08, sweep_to=90)), (0, _noise(.05, .25, .3)))
+    S['delete'] = _tone(500, .12, 'square', .18, .002, .1, sweep_to=180)
+    S['launch'] = _mix((0, _tone(95, .14, 'sine', .7, .002, .12, sweep_to=45)),
+                       (0, _noise(.32, .45, .55, .01, .25, smooth_to=.2)))
+    S['collect'] = _tone(380, .09, 'sine', .45, .003, .06, sweep_to=950)
+    S['deposit'] = _mix((0, _bell(880, .35, .3)), (.08, _bell(1320, .45, .25)))
+    S['tip'] = _mix((0, _tone(70, .5, 'sine', .8, .002, .45, sweep_to=40)),
+                    (0, _noise(.6, .35, .4, .01, .5)),
+                    (.15, _bell(523, .5, .25)), (.27, _bell(659, .5, .25)),
+                    (.39, _bell(784, .5, .25)), (.51, _bell(1047, .7, .3)))
+    S['foul'] = _mix((0, _tone(140, .55, 'square', .22, .01, .08)), (0, _tone(147, .55, 'square', .18, .01, .08)))
+    S['error'] = _mix((0, _tone(300, .08, 'square', .15)), (.11, _tone(220, .12, 'square', .15)))
+    S['drop'] = _tone(260, .12, 'triangle', .4, .002, .1, sweep_to=150)
+    S['bounce'] = _tone(320, .05, 'triangle', .35, .001, .045, sweep_to=200)
+    fan = []
+    for k, (f, d) in enumerate(((392, .12), (523, .12), (659, .12), (784, .45))):
+        fan.append((k * .13, _tone(f, d, 'square', .16, .005, .1)))
+        fan.append((k * .13, _tone(f / 2, d, 'triangle', .25, .005, .1)))
+    S['start'] = _mix(*fan)
+    S['auto_end'] = _mix((0, _bell(988, .5)), (.25, _bell(988, .7)))
+    S['teleop'] = _mix((0, _tone(660, .12, 'square', .15)), (.17, _tone(660, .12, 'square', .15)),
+                       (.34, _tone(990, .35, 'square', .17, .005, .2)))
+    S['warning'] = _mix((0, _bell(1175, .6, .35)), (.3, _bell(1175, .6, .35)), (.6, _bell(1568, .9, .35)))
+    S['end'] = _mix((0, _tone(110, 1.3, 'saw', .25, .01, .2)), (0, _tone(165, 1.3, 'square', .14, .01, .2)),
+                    (0, _tone(220, 1.3, 'square', .08, .01, .2)))
+    S['intro'] = _mix((0, _noise(1.4, .18, .6, .6, .7, smooth_to=.95)),
+                      (.1, _tone(261.6, 2.3, 'sine', .14, .7, 1.2)), (.1, _tone(392, 2.3, 'sine', .11, .8, 1.2)),
+                      (.1, _tone(523.2, 2.3, 'sine', .08, .9, 1.2)), (.9, _bell(1046, 1.2, .18)))
+    hum = []                                     # 1-second seamless motor loop (whole cycles)
+    for i in range(SR):
+        t = i / SR
+        v = (.5 * math.sin(2 * math.pi * 110 * t) + .25 * math.sin(2 * math.pi * 220 * t)
+             + .15 * (2 * ((330 * t) % 1) - 1) + .08 * math.sin(2 * math.pi * 55 * t))
+        hum.append(v * .35)
+    S['hum'] = hum
+    return S
+
+
+def _make_music():
+    """Original cozy 'garden' loop: C-Am-F-G, 104 BPM, marimba lead, pads, bass, shaker.
+    The melody is generated from a fixed seed, so it is the same every time."""
+    bpm = 104
+    beat = 60 / bpm
+    bars = 16
+    total = int(bars * 4 * beat * SR)
+    buf = [0.0] * (total + SR)
+    rng = random.Random(2026)
+
+    def note(midi, start, dur, kind, vol):
+        f = 440 * 2 ** ((midi - 69) / 12)
+        s0, n = int(start * SR), int(dur * SR)
+        tw = 2 * math.pi * f / SR
+        for i in range(n):
+            t = i / SR
+            if kind == 'marimba':
+                e = math.exp(-t * 7) * min(1, i / 60)
+                v = math.sin(tw * i) + .35 * math.sin(4 * tw * i) * math.exp(-t * 20)
+            elif kind == 'pad':
+                e = min(1, t / .25, (n - i) / (.3 * SR))
+                v = math.sin(tw * i) + .3 * math.sin(2.003 * tw * i)
+            elif kind == 'bass':
+                e = math.exp(-t * 3) * min(1, i / 80)
+                v = math.sin(tw * i) + .2 * math.sin(2 * tw * i)
+            else:                                            # bell sparkle
+                e = math.exp(-t * 4) * min(1, i / 40)
+                v = math.sin(tw * i) * .7 + .3 * math.sin(2.76 * tw * i)
+            buf[s0 + i] += v * e * vol
+
+    chords = [(48, [60, 64, 67]), (45, [57, 60, 64]), (41, [57, 60, 65]), (43, [59, 62, 67])]   # C Am F G
+    scale = [60, 62, 64, 67, 69, 72, 74, 76, 79]                  # C major pentatonic
+    motif = None
+    idx = 4
+    for bar in range(bars):
+        root, triad = chords[bar % 4]
+        t0 = bar * 4 * beat
+        for m in triad:                                          # soft pad
+            note(m, t0, 4 * beat, 'pad', .045)
+        for k, off in enumerate((0, 1.5, 2, 3)):                  # bouncy bass
+            note(root + (12 if k == 2 else 0), t0 + off * beat, .45 * beat, 'bass', .22)
+        # melody: an original 2-bar motif that varies as the song goes on
+        if bar % 2 == 0:
+            if motif is None or bar % 8 == 0:
+                motif = []
+                for step in range(8):
+                    idx = max(0, min(len(scale) - 1, idx + rng.choice((-2, -1, -1, 0, 1, 1, 2))))
+                    rest = rng.random() < .18
+                    motif.append(None if rest else scale[idx])
+            phrase = motif if bar % 8 < 4 else [None if m is None else m + (2 if m in (60, 67, 72) else 0) for m in motif]
+        half = (bar % 2) * 4
+        for step in range(4):
+            m = phrase[half + step]
+            chord_tones = [x % 12 for x in triad]
+            if m is not None:
+                if step == 0 and m % 12 not in chord_tones:          # land on a chord tone each bar
+                    m = min((t for t in scale if t % 12 in chord_tones), key=lambda t: abs(t - m))
+                note(m, t0 + step * beat, beat * .9, 'marimba', .2)
+                if rng.random() < .35:                               # little pickup note
+                    note(m + rng.choice((2, 3, 5)), t0 + (step + .5) * beat, beat * .45, 'marimba', .12)
+        if bar % 4 == 3:                                             # sparkle at phrase ends
+            for j, m in enumerate((84, 88, 91)):
+                note(m, t0 + (3 + j * .33) * beat, beat, 'bell', .05)
+        for e in range(8):                                           # shaker on the off-beats
+            if e % 2:
+                st = int((t0 + e * .5 * beat) * SR)
+                y = 0.0
+                for i in range(int(.07 * SR)):
+                    y = .55 * y + .45 * rng.uniform(-1, 1)
+                    buf[st + i] += y * .05 * math.exp(-i / (.02 * SR))
+    for i in range(SR):                                              # wrap the tail for a seamless loop
+        buf[i] += buf[total + i]
+    return buf[:total]
+
+
+def _write_wav(path, samples):
+    peak = max(1e-6, max(abs(v) for v in samples))
+    g = .9 / peak if peak > .9 else 1.0
+    data = array('h', (int(clamp(v * g, -1, 1) * 32000) for v in samples))
+    with wave.open(str(path), 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(data.tobytes())
+
+
+class SoundFX:
+    def __init__(self):
+        self.ok, self.muted = False, False
+        self.snd, self.last = {}, {}
+        self.hum = self.music = None
+        self.music_on, self.music_started = True, False
+        try:
+            folder = Path(__file__).with_name('sim_sounds')
+            folder.mkdir(exist_ok=True)
+            stamp = folder / f'v{SOUND_VERSION}.txt'
+            if not stamp.exists():
+                for name, samples in _make_sounds().items():
+                    _write_wav(folder / f'{name}.wav', samples)
+                _write_wav(folder / 'music.wav', _make_music())
+                stamp.write_text('generated by ftc_hub_simulator.py')
+            from panda3d.core import Filename as _Fn
+            from ursina.audio import _audio_manager as _uam    # Ursina's own audio manager
+            cands = [('ursina', _uam)] + [('panda', m) for m in (getattr(base, 'sfxManagerList', None) or [])]
+            name_am, _am = next(((n, m) for n, m in cands if m.isValid()), cands[0])
+            print(f'[sound] audio device: {name_am} manager, working={_am.isValid()}')
+            self.mgr = _am
+            for f in folder.glob('*.wav'):
+                self.snd[f.stem] = _am.getSound(_Fn.fromOsSpecific(str(f.resolve())))
+            self.hum = self.snd.get('hum')
+            self.music = self.snd.get('music')
+            for own in ('my_music.ogg', 'my_music.wav', 'my_music.mp3'):      # your own track wins
+                pth = Path(__file__).with_name(own)
+                if pth.exists():
+                    self.music = _am.getSound(_Fn.fromOsSpecific(str(pth.resolve())))
+                    break
+            if self.music:
+                self.music.setLoop(True)
+                self.music.setVolume(.22)
+            if self.hum:
+                self.hum.setLoop(True)
+                self.hum.setVolume(0)
+                self.hum.play()
+            self.ok = bool(self.snd)
+            print(f'[sound] loaded {len(self.snd)} sounds from {folder}' if self.ok else '[sound] no sounds loaded')
+        except Exception as e:
+            print('[warning] sound disabled:', e)
+
+    def update(self):
+        if self.ok and getattr(self, 'mgr', None) is not None:
+            try:
+                self.mgr.update()
+            except Exception:
+                pass
+
+    def play(self, name, vol=1.0, rate=1.0, min_gap=.03):
+        if not self.ok or self.muted or name not in self.snd:
+            return
+        now = _pytime.time()
+        if now - self.last.get(name, 0) < min_gap:
+            return
+        self.last[name] = now
+        s = self.snd[name]
+        s.setVolume(vol)
+        s.setPlayRate(rate)
+        s.play()
+
+    def motor(self, amount):
+        if not (self.ok and self.hum):
+            return
+        a = 0 if self.muted else clamp(amount, 0, 1)
+        self.hum.setVolume(.03 + .3 * a if a > .02 else 0)
+        self.hum.setPlayRate(.7 + .9 * a)
+
+    def start_music(self):
+        if self.ok and self.music and not self.music_started:
+            self.music_started = True
+            if self.music_on and not self.muted:
+                self.music.play()
+
+    def toggle_music(self):
+        self.music_on = not self.music_on
+        if self.music:
+            if self.music_on and not self.muted:
+                self.music.play()
+            else:
+                self.music.stop()
+        return self.music_on
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.muted and self.hum:
+            self.hum.setVolume(0)
+        if self.music and self.music_started:
+            if self.muted or not self.music_on:
+                self.music.stop()
+            else:
+                self.music.play()
+        return self.muted
+
+
+sfx = SoundFX()
 
 
 # ----------------------------------------------------------------------------
@@ -1716,6 +2008,7 @@ class BuildBay(Entity):
             return False
         owner = self._attach_owner(mouse.hovered_entity)
         self.snapshot()
+        sfx.play('place', .7, random.uniform(.9, 1.1))
         self._add(self.sel, Vec3(self.ghost.position), Vec3(self.ghost.rotation), owner)
         if self.mghost and self.mghost.enabled:
             self._add(self.mpid, Vec3(self.mghost.position), Vec3(self.mghost.rotation), owner)
@@ -1735,6 +2028,7 @@ class BuildBay(Entity):
             return
         if record:
             self.snapshot()
+            sfx.play('delete', .6)
         self.hover_box.parent = self
         self.hover_box.enabled = False
         doomed = [r for r in self.items if self._descends(r, part)]
@@ -2593,6 +2887,7 @@ class Game:
         toast(text, col)
 
     def foul(self, offender_team, major, rule, text):
+        sfx.play('foul', .8)
         pts = 20 if major else 5
         if self.phase in ('auto', 'teleop'):
             self.foul_pts[OTHER[offender_team]] += pts
@@ -2602,6 +2897,7 @@ class Game:
             self.msg(f'{rule}: {text} (would be a foul in a match)', color.orange)
 
     def on_tip(self, team):
+        sfx.play('tip', .9)
         if self.phase == 'auto':
             self.tips[team][0] += 1
         else:
@@ -2614,6 +2910,7 @@ class Game:
             self._hp_drop(team, b)
 
     def _hp_drop(self, team, b):
+        sfx.play('drop', .5, random.uniform(.9, 1.1))
         x0, x1, z0, z1 = LOADING_ZONE[team]
         b.parent = scene
         b.position = Vec3(lerp(x0, x1, random.uniform(.3, .7)), .4, lerp(z0, z1, random.uniform(.3, .7)))
@@ -2641,6 +2938,7 @@ class Game:
         return True
 
     def _collect(self, r, b):
+        sfx.play('collect', .6 if r is self.player else .25, random.uniform(.95, 1.1))
         self.field_balls.remove(b)
         r.stow(b)
         if b.kind == 'nectar' and b.team != r.team:
@@ -2676,6 +2974,7 @@ class Game:
         self.flights.append((b, b.flight))
         r.launch_cd = .35
         r.kick_flywheel()
+        sfx.play('launch', .7 if r is self.player else .3, random.uniform(.9, 1.1), min_gap=.05)
         return True
 
     def nearest_flower(self, r, max_d=None):
@@ -2731,6 +3030,7 @@ class Game:
             return False
         r.unstow(b)
         fl.add(b)
+        sfx.play('deposit', .6 if r is self.player else .3)
         return True
 
     def robot_drop(self, r, b=None, quiet=False):
@@ -2753,18 +3053,22 @@ class Game:
             if self.phase == 'pre' and self.t >= 3:
                 self.phase, self.t = 'auto', 0.0
                 self.msg('AUTO - robots run on their own for 30 seconds', color.cyan)
+                sfx.play('start', .8)
             elif self.phase == 'auto' and self.t >= AUTO_T:
                 for r in self.robots:
                     self.auto_park[id(r)] = self.in_loading_zone(r)
                 self.phase, self.t = 'transition', 0.0
                 self.msg('Drivers, pick up your controllers!', color.cyan)
+                sfx.play('auto_end', .8)
             elif self.phase == 'transition' and self.t >= TRANS_T:
                 self.phase, self.t = 'teleop', 0.0
                 self.msg('TELEOP - 2:00 of driver control', color.lime)
+                sfx.play('teleop', .8)
             elif self.phase == 'teleop':
                 if not self.bloomed and self.time_left() <= 60:
                     self.bloomed = True
                     self.msg('1:00 LEFT - Flowers open! Human players add all Nectar', color.lime)
+                    sfx.play('warning', .8)
                     for team in (RED, BLUE):
                         while True:
                             b = self.hp[team].give()
@@ -2860,6 +3164,8 @@ class Game:
             p = b.position + v * dt
             if p.y < b.r:
                 p.y = b.r
+                if v.y < -5:
+                    sfx.play('bounce', clamp(-v.y / 25, .05, .35), random.uniform(.85, 1.3), min_gap=.06)
                 if v.y < -2:
                     v.y *= -.35
                     v.x *= .8
@@ -2968,6 +3274,7 @@ class Game:
         return s
 
     def end_match(self):
+        sfx.play('end', .8)
         self.phase = 'over'
         red, blue = self.score(RED), self.score(BLUE)
         res = {RED: red, BLUE: blue}
@@ -3104,6 +3411,8 @@ toast_t = 0.0
 
 def toast(msg, col=color.yellow):
     global toast_t
+    if col == color.red:
+        sfx.play('error', .5)
     toast_text.text, toast_text.color = msg, col
     toast_t = 2.6
 
@@ -3112,7 +3421,7 @@ sim_ui = Entity(parent=camera.ui)
 help_text = Text(parent=sim_ui, position=(window.top_left.x + .02, -.39), scale=.72, background=True, text=(
     'WASD drive | Q/E turn | Up/Down lift | SPACE launch into Hive | V intake on/off or claw grab\n'
     'F fill Flower | G drop piece (Garden) | N human player Nectar | TAB opmode | R reset field\n'
-    'C wifi | T touch | H spin hub | 1/2/3/4 camera | B build mode'))
+    'C wifi | T touch | H spin hub | 1/2/3/4 camera | B build | M mute | K music'))
 status_hud = Text(parent=sim_ui, text='', position=(0, .345), origin=(0, 0), scale=1.1)
 
 score_ui = Entity(parent=camera.ui)
@@ -3451,6 +3760,7 @@ class Splash(Entity):
 
 
 splash = Splash()
+sfx.play('intro', .8)
 
 # ----------------------------------------------------------------------------
 # Sensors + main loop
@@ -3519,8 +3829,10 @@ def update():
     global run_time, battery, clock, tel_timer, toast_t, state, splash
     dt = time.dt
     clock += dt
+    sfx.update()
     if splash is not None and not splash.step(dt):
         splash = None
+        sfx.start_music()
 
     if toast_t > 0:
         toast_t -= dt
@@ -3564,6 +3876,10 @@ def update():
         game.update(dt)
         update_scoreboard()
     pad.show(f, s, t)
+    hum = sum(abs(p) for p in robot.powers) / 4 if enabled else 0
+    if mode == 'match' and game.phase in ('auto', 'teleop'):
+        hum = max(hum, .25 * max([sum(abs(p) for p in a.r.powers) / 4 for a in game.ai_drivers[1:]] + [0]))
+    sfx.motor(hum if mode in ('sim', 'match') else 0)
 
     if state == 'RUNNING':
         run_time += dt
@@ -3637,6 +3953,14 @@ def update():
 
 def input(key):
     global state, run_time, cam_mode, spin_showcase
+    if key == 'left mouse down' and isinstance(mouse.hovered_entity, Button):
+        sfx.play('click', .6)
+    if key == 'm' and mode != 'build':
+        toast('Sound OFF (M)' if sfx.toggle_mute() else 'Sound ON (M)', color.white)
+        return
+    if key == 'k':
+        toast('Music ON (K)' if sfx.toggle_music() else 'Music OFF (K)', color.white)
+        return
     if splash is not None:                      # first key / click skips the intro
         if not key.endswith(' up'):
             splash.skip()
